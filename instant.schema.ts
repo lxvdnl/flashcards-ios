@@ -13,8 +13,14 @@ const _schema = i.schema({
       imageURL: i.string().optional(),
       type: i.string().optional(),
     }),
-    colors: i.entity({
-      value: i.string(),
+    cardSets: i.entity({
+      name: i.string().indexed(),
+      createdAt: i.number().indexed(),
+    }),
+    cards: i.entity({
+      front: i.string(),
+      back: i.string(),
+      createdAt: i.number().indexed(),
     }),
   },
   rooms: {},
@@ -30,6 +36,18 @@ const _schema = i.schema({
         on: "$users",
         has: "many",
         label: "linkedGuestUsers",
+      },
+    },
+    cardSetCards: {
+      forward: {
+        on: "cardSets",
+        has: "many",
+        label: "cards",
+      },
+      reverse: {
+        on: "cards",
+        has: "one",
+        label: "cardSet",
       },
     },
   },
