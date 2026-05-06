@@ -94,32 +94,53 @@ function ThemeToggle() {
   );
 }
 
+// ─── Last-studied helper ──────────────────────────────────────────────────────
+
+function studiedLabel(ts: number | null | undefined): { text: string; color: string } {
+  if (!ts) return { text: "Never studied", color: "#FF3B30" };
+
+  const elapsed = Date.now() - ts;
+  const mins  = elapsed / 60_000;
+  const hours = elapsed / 3_600_000;
+  const days  = elapsed / 86_400_000;
+
+  if (mins  < 1)  return { text: "Just now",           color: "#8E8E93" };
+  if (hours < 1)  return { text: `${Math.floor(mins)}m ago`,  color: "#8E8E93" };
+  if (hours < 24) return { text: `${Math.floor(hours)}h ago`, color: "#34C759" };
+  if (days  < 2)  return { text: "Yesterday",          color: "#FFCC02" };
+  if (days  < 7)  return { text: `${Math.floor(days)} days ago`, color: "#FF9500" };
+  return               { text: `${Math.floor(days)} days ago`, color: "#FF3B30" };
+}
+
 // ─── Set Card ─────────────────────────────────────────────────────────────────
-// Separate component so pressed state is per-item and doesn't use function style
-// (function-based Pressable style breaks layout flow on iOS)
 
 function SetCard({
   item,
   colors,
-  onPress,
+  onStudyAll,
+  onSmartStudy,
+  onContinue,
   onLongPress,
 }: {
   item: CardSet;
   colors: Colors;
-  onPress: () => void;
+  onStudyAll: () => void;
+  onSmartStudy: () => void;
+  onContinue: () => void;
   onLongPress: () => void;
 }) {
   const [pressed, setPressed] = useState(false);
+
   return (
     <Pressable
-      onPress={onPress}
       onLongPress={onLongPress}
       onPressIn={() => setPressed(true)}
       onPressOut={() => setPressed(false)}
       style={{
         backgroundColor: pressed ? colors.PRIMARY_LIGHT : colors.CARD,
         borderRadius: 14,
-        paddingVertical: 16,
+        paddingTop: 14,
+        paddingBottom: 12,
         paddingHorizontal: 18,
         borderWidth: 1,
         borderColor: colors.BORDER,
@@ -131,12 +152,70 @@ function SetCard({
         marginBottom: 10,
       }}
     >
-      <Text style={{ fontSize: 17, fontWeight: "600", color: colors.TEXT, marginBottom: 4 }}>
-        {item.name}
-      </Text>
-      <Text style={{ fontSize: 13, color: colors.MUTED }}>
-        {item.cards.length === 1 ? "1 card" : `${item.cards.length} cards`}
-      </Text>
+      {/* Header row: name + due badge */}
+      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 2 }}>
+        <Text style={{ fontSize: 17, fontWeight: "600", color: colors.TEXT, flex: 1, marginRight: 8 }}>
+          {item.name}
+        </Text>
+      </View>
+
+      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <Text style={{ fontSize: 13, color: colors.MUTED }}>
+          {item.cards.length === 1 ? "1 card" : `${item.cards.length} cards`}
+        </Text>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 5 }}>
+          {(() => {
+            const { text, color } = studiedLabel(item.lastStudiedAt);
+            return (
+              <Text style={{ fontSize: 12, fontWeight: "600", color }}>{text}</Text>
+            );
+          })()}
+          {item.sessionCompleted === true && (
+            <Text style={{ fontSize: 11, fontWeight: "800", color: "#34C759" }}>✓</Text>
+          )}
+        </View>
+      </View>
+
+      {/* Action buttons */}
+      <View style={{ flexDirection: "row", gap: 8 }}>
+        <Pressable
+          onPress={item.sessionCompleted === false ? onContinue : onSmartStudy}
+          style={{
+            flex: 1,
+            paddingVertical: 9,
+            borderRadius: 10,
+            alignItems: "center",
+            backgroundColor: colors.PRIMARY,
+            flexDirection: "row",
+            justifyContent: "center",
+            gap: 5,
+          }}
+        >
+          {item.sessionCompleted === false && (
+            <Ionicons name="play-circle" size={14} color="#fff" />
+          )}
+          <Text style={{ fontSize: 13, fontWeight: "600", color: "#fff" }}>
+            {item.sessionCompleted === false ? "Continue" : "Smart Study"}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          onPress={onStudyAll}
+          style={{
+            flex: 1,
+            paddingVertical: 9,
+            borderRadius: 10,
+            alignItems: "center",
+            borderWidth: 1,
+            borderColor: colors.BORDER,
+            backgroundColor: colors.PRIMARY_LIGHT,
+          }}
+        >
+          <Text style={{ fontSize: 13, fontWeight: "600", color: colors.PRIMARY }}>
+            Study All
+          </Text>
+        </Pressable>
+      </View>
     </Pressable>
   );
 }
@@ -232,7 +311,7 @@ export default function HomeScreen() {
         <ThemeToggle />
       </View>
 
-      {/* Block 2: New Set — wrapper aligns right, no alignSelf on Pressable */}
+      {/* Block 2: New Set */}
       <View style={{ alignItems: "flex-end", marginHorizontal: 20, marginTop: 20, marginBottom: 6 }}>
         <Pressable
           onPress={() => router.push("/create")}
@@ -277,14 +356,22 @@ export default function HomeScreen() {
           data={cardSets}
           keyExtractor={(item) => item.id}
           contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 16, paddingBottom: 32 }}
-          renderItem={({ item }) => (
-            <SetCard
-              item={item}
-              colors={colors}
-              onPress={() => router.push(`/study/${item.id}`)}
-              onLongPress={() => handleDeleteSet(item)}
-            />
-          )}
+          renderItem={({ item }) => {
+            return (
+              <SetCard
+                item={item}
+                colors={colors}
+                onStudyAll={() => router.push(`/study/${item.id}`)}
+                onSmartStudy={() => router.push(`/study/${item.id}?mode=smart`)}
+                onContinue={() => router.push(
+                  item.sessionMode === "smart"
+                    ? `/study/${item.id}?mode=smart`
+                    : `/study/${item.id}`
+                )}
+                onLongPress={() => handleDeleteSet(item)}
+              />
+            );
+          }}
         />
       )}
     </View>

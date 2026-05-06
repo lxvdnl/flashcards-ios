@@ -2,7 +2,7 @@ import { db } from "@/lib/db";
 import { AppSchema } from "@/instant.schema";
 import { InstaQLEntity } from "@instantdb/react-native";
 import { useLocalSearchParams, useRouter, useNavigation } from "expo-router";
-import { useState, useCallback, useMemo, useRef, useEffect } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect, useLayoutEffect } from "react";
 import {
   View,
   Text,
@@ -24,6 +24,7 @@ import Animated, {
 import * as Haptics from "expo-haptics";
 import { useTheme } from "@/contexts/ThemeContext";
 import type { Colors } from "@/lib/theme";
+import { computeNextReview, shuffle } from "@/lib/srs";
 
 type Card = InstaQLEntity<AppSchema, "cards">;
 
@@ -31,7 +32,8 @@ const SCREEN_WIDTH = Dimensions.get("window").width;
 const SWIPE_THRESHOLD = SCREEN_WIDTH * 0.18;
 
 export default function StudyScreen() {
-  const { id: setId } = useLocalSearchParams<{ id: string }>();
+  const { id: setId, mode } = useLocalSearchParams<{ id: string; mode?: string }>();
+  const isSmartMode = mode === "smart";
   const router = useRouter();
   const navigation = useNavigation();
   const { colors } = useTheme();
@@ -57,12 +59,75 @@ export default function StudyScreen() {
   const [pile, setPile] = useState<Card[]>([]);
   const [knownCount, setKnownCount] = useState(0);
   const [isFlipped, setIsFlipped] = useState(false);
+  const [hasBeenFlipped, setHasBeenFlipped] = useState(false);
   const initialized = useRef(false);
+  // Tracks which cards have been sent back once via Hard (they get exactly one comeback).
+  const hardQueuedRef = useRef(new Set<string>());
+  // Tracks cards that were re-queued (Hard or Again) before being swiped right.
+  // Cards NOT in this set when swiped right are "first-attempt easy" → marked mastered.
+  const seenBeforeRef = useRef(new Set<string>());
+  // Initial pile size — used for progress since pile.length alone doesn't account for re-queued cards.
+  const sessionTotalRef = useRef(0);
+
+  function startSession(cards: Card[]) {
+    const initial = shuffle([...cards]);
+    setPile(initial);
+    setKnownCount(0);
+    setIsFlipped(false);
+    setHasBeenFlipped(false);
+    hardQueuedRef.current.clear();
+    seenBeforeRef.current.clear();
+    sessionTotalRef.current = initial.length;
+    flipProgress.value = 0;
+    translateX.value = 0;
+    if (setId) {
+      db.transact([db.tx.cardSets[setId].update({
+        lastStudiedAt: Date.now(),
+        sessionPileIds: JSON.stringify(initial.map((c) => c.id)),
+        sessionMode: isSmartMode ? "smart" : "all",
+        sessionCompleted: false,
+        sessionTotal: initial.length,
+      })]);
+    }
+  }
+
+  function sessionCards() {
+    return isSmartMode
+      ? originalCards.filter((c) => !c.mastered)
+      : [...originalCards];
+  }
 
   useEffect(() => {
     if (!initialized.current && originalCards.length > 0) {
       initialized.current = true;
-      setPile([...originalCards]);
+      const currentMode = isSmartMode ? "smart" : "all";
+      const savedCompleted = cardSet?.sessionCompleted;
+      const savedPileIdsStr = cardSet?.sessionPileIds;
+      const savedMode = cardSet?.sessionMode;
+      const savedTotal = cardSet?.sessionTotal;
+
+      if (savedCompleted === false && savedPileIdsStr && savedMode === currentMode) {
+        try {
+          const savedIds: string[] = JSON.parse(savedPileIdsStr);
+          const cardMap = new Map(originalCards.map((c) => [c.id, c]));
+          const restoredPile = savedIds.map((id) => cardMap.get(id)).filter((c): c is Card => !!c);
+          if (restoredPile.length > 0) {
+            const total = Math.max(savedTotal ?? restoredPile.length, restoredPile.length);
+            setPile(restoredPile);
+            setKnownCount(total - restoredPile.length);
+            sessionTotalRef.current = total;
+            // Mark all restored cards as "seen before" to prevent false mastery on resume.
+            restoredPile.forEach((c) => seenBeforeRef.current.add(c.id));
+            flipProgress.value = 0;
+            translateX.value = 0;
+            return;
+          }
+        } catch {
+          // JSON parse failed — fall through to start fresh
+        }
+      }
+
+      startSession(sessionCards());
     }
   }, [originalCards.length]);
 
@@ -74,29 +139,110 @@ export default function StudyScreen() {
   const translateX = useSharedValue(0);
   const flipProgress = useSharedValue(0);
 
+  // Reset card position AFTER React commits the new pile so old card never snaps back.
+  const prevTopCardIdRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const topId = pile[0]?.id ?? null;
+    if (topId !== prevTopCardIdRef.current) {
+      prevTopCardIdRef.current = topId;
+      translateX.value = 0;
+    }
+  }, [pile]);
+
+  const savePile = useCallback((newPile: Card[], isComplete?: boolean, extra?: any[]) => {
+    if (!setId) return;
+    const cardSetTx = db.tx.cardSets[setId].update({
+      sessionPileIds: JSON.stringify(newPile.map((c) => c.id)),
+      ...(isComplete ? { sessionCompleted: true } : {}),
+    });
+    db.transact([cardSetTx, ...(extra ?? [])]);
+  }, [setId]);
+
   const handleFlip = useCallback(() => {
     const next = !isFlipped;
     setIsFlipped(next);
+    if (next) setHasBeenFlipped(true);
     flipProgress.value = withTiming(next ? 1 : 0, { duration: 150 });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, [isFlipped]);
 
+  // Swipe right = Easy in both modes. Always removes card from pile.
+  // In smart mode, cards answered correctly on the first attempt (never re-queued) are marked mastered
+  // and excluded from all future Smart Study sessions.
   const handleSwipeRight = useCallback(() => {
-    translateX.value = 0;
+    const card = pileRef.current[0];
+    const newPile = pileRef.current.slice(1);
+    const extra: any[] = [];
+    if (isSmartMode && card) {
+      const isFirstAttempt = !seenBeforeRef.current.has(card.id);
+      const srsData = computeNextReview(card, "easy");
+      extra.push(db.tx.cards[card.id].update(
+        isFirstAttempt ? { ...srsData, mastered: true } : srsData
+      ));
+      hardQueuedRef.current.delete(card.id);
+      seenBeforeRef.current.delete(card.id);
+    }
+    savePile(newPile, newPile.length === 0, extra);
     flipProgress.value = 0;
     setIsFlipped(false);
-    setPile((prev) => prev.slice(1));
+    setHasBeenFlipped(false);
+    setPile(newPile);
     setKnownCount((c) => c + 1);
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-  }, []);
+  }, [isSmartMode, savePile]);
 
+  // Swipe left = Again.
+  // Smart mode: re-queues the card to the end (card will appear again).
+  // Study All: one pass — just removes the card (same as right swipe but no success haptic).
   const handleSwipeLeft = useCallback(() => {
-    translateX.value = 0;
+    const card = pileRef.current[0];
     flipProgress.value = 0;
     setIsFlipped(false);
-    setPile((prev) => [...prev.slice(1), prev[0]]);
+    setHasBeenFlipped(false);
+    if (isSmartMode) {
+      const newPile = [...pileRef.current.slice(1), pileRef.current[0]];
+      const extra: any[] = [];
+      if (card) {
+        seenBeforeRef.current.add(card.id);
+        extra.push(db.tx.cards[card.id].update(computeNextReview(card, "again")));
+      }
+      savePile(newPile, false, extra);
+      setPile(newPile);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    } else {
+      const newPile = pileRef.current.slice(1);
+      savePile(newPile, newPile.length === 0);
+      setPile(newPile);
+      setKnownCount((c) => c + 1);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }
+  }, [isSmartMode, savePile]);
+
+  // Hard = re-queues card for exactly one more encounter, then it leaves the pile.
+  const handleHard = useCallback(() => {
+    const card = pileRef.current[0];
+    if (!card) return;
+    const srsUpdate = db.tx.cards[card.id].update(computeNextReview(card, "hard"));
+    flipProgress.value = 0;
+    setIsFlipped(false);
+    setHasBeenFlipped(false);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-  }, []);
+    if (hardQueuedRef.current.has(card.id)) {
+      // Second encounter after Hard — card is done.
+      const newPile = pileRef.current.slice(1);
+      hardQueuedRef.current.delete(card.id);
+      savePile(newPile, newPile.length === 0, [srsUpdate]);
+      setPile(newPile);
+      setKnownCount((c) => c + 1);
+    } else {
+      // First Hard press — mark as seen (not first-attempt easy) and send back once.
+      const newPile = [...pileRef.current.slice(1), pileRef.current[0]];
+      seenBeforeRef.current.add(card.id);
+      hardQueuedRef.current.add(card.id);
+      savePile(newPile, false, [srsUpdate]);
+      setPile(newPile);
+    }
+  }, [savePile]);
 
   const panGesture = useMemo(
     () =>
@@ -110,17 +256,13 @@ export default function StudyScreen() {
             translateX.value = withTiming(
               SCREEN_WIDTH * 1.5,
               { duration: 200 },
-              () => {
-                runOnJS(handleSwipeRight)();
-              }
+              () => { runOnJS(handleSwipeRight)(); }
             );
           } else if (e.translationX < -SWIPE_THRESHOLD) {
             translateX.value = withTiming(
               -SCREEN_WIDTH * 1.5,
               { duration: 200 },
-              () => {
-                runOnJS(handleSwipeLeft)();
-              }
+              () => { runOnJS(handleSwipeLeft)(); }
             );
           } else {
             translateX.value = withSpring(0);
@@ -167,10 +309,7 @@ export default function StudyScreen() {
       transform: [{ perspective: 1000 }, { rotateY: `${rotateY}deg` }],
       backfaceVisibility: "hidden",
       position: "absolute",
-      top: 0,
-      left: 0,
-      right: 0,
-      bottom: 0,
+      top: 0, left: 0, right: 0, bottom: 0,
     };
   });
 
@@ -180,10 +319,7 @@ export default function StudyScreen() {
       transform: [{ perspective: 1000 }, { rotateY: `${rotateY}deg` }],
       backfaceVisibility: "hidden",
       position: "absolute",
-      top: 0,
-      left: 0,
-      right: 0,
-      bottom: 0,
+      top: 0, left: 0, right: 0, bottom: 0,
     };
   });
 
@@ -202,59 +338,33 @@ export default function StudyScreen() {
   const s = makeStyles(colors);
 
   if (isLoading) {
-    return (
-      <View style={s.center}>
-        <ActivityIndicator color={colors.PRIMARY} />
-      </View>
-    );
+    return <View style={s.center}><ActivityIndicator color={colors.PRIMARY} /></View>;
   }
 
   if (error) {
-    return (
-      <View style={s.center}>
-        <Text style={{ color: colors.MUTED }}>Error: {error.message}</Text>
-      </View>
-    );
+    return <View style={s.center}><Text style={{ color: colors.MUTED }}>Error: {error.message}</Text></View>;
   }
 
-  const totalCards = pile.length + knownCount;
+  const sessionTotal = sessionTotalRef.current;
 
-  if (initialized.current && pile.length === 0 && knownCount > 0) {
+  // Done screen — shown when pile is empty after a real session.
+  if (initialized.current && pile.length === 0 && sessionTotal > 0) {
     return (
       <View style={s.center}>
         <Text style={{ fontSize: 56, marginBottom: 16 }}>🎉</Text>
-        <Text
-          style={{
-            fontSize: 24,
-            fontWeight: "700",
-            color: colors.TEXT,
-            marginBottom: 8,
-          }}
-        >
+        <Text style={{ fontSize: 24, fontWeight: "700", color: colors.TEXT, marginBottom: 8 }}>
           All done!
         </Text>
-        <Text
-          style={{
-            fontSize: 15,
-            color: colors.MUTED,
-            marginBottom: 48,
-            textAlign: "center",
-          }}
-        >
-          You studied {totalCards} card{totalCards !== 1 ? "s" : ""}
+        <Text style={{ fontSize: 15, color: colors.MUTED, marginBottom: 48, textAlign: "center" }}>
+          You studied {sessionTotal} card{sessionTotal !== 1 ? "s" : ""}
         </Text>
         <Pressable
           style={s.primaryBtn}
           onPress={() => {
             initialized.current = false;
-            setPile([...originalCards]);
-            setKnownCount(0);
-            setIsFlipped(false);
-            flipProgress.value = 0;
-            translateX.value = 0;
-            setTimeout(() => {
-              initialized.current = false;
-            }, 0);
+            prevTopCardIdRef.current = null;
+            startSession(sessionCards());
+            setTimeout(() => { initialized.current = true; }, 0);
           }}
         >
           <Text style={s.primaryBtnText}>Study Again</Text>
@@ -267,15 +377,28 @@ export default function StudyScreen() {
   }
 
   if (pile.length === 0) {
-    return (
-      <View style={s.center}>
-        <ActivityIndicator color={colors.PRIMARY} />
-      </View>
-    );
+    // Smart Study started but all cards are mastered — nothing to show.
+    if (initialized.current && sessionTotal === 0 && isSmartMode) {
+      return (
+        <View style={s.center}>
+          <Text style={{ fontSize: 56, marginBottom: 16 }}>🏆</Text>
+          <Text style={{ fontSize: 22, fontWeight: "700", color: colors.TEXT, marginBottom: 8 }}>
+            All mastered!
+          </Text>
+          <Text style={{ fontSize: 15, color: colors.MUTED, marginBottom: 48, textAlign: "center" }}>
+            Every card in this set is mastered. Use Study All to review them.
+          </Text>
+          <Pressable style={s.primaryBtn} onPress={() => router.back()}>
+            <Text style={s.primaryBtnText}>Back to Sets</Text>
+          </Pressable>
+        </View>
+      );
+    }
+    return <View style={s.center}><ActivityIndicator color={colors.PRIMARY} /></View>;
   }
 
   const current = pile[0];
-  const progress = knownCount / totalCards;
+  const progress = sessionTotal > 0 ? knownCount / sessionTotal : 0;
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.BG }}>
@@ -283,40 +406,27 @@ export default function StudyScreen() {
         <View style={s.progressTrack}>
           <View style={[s.progressFill, { width: `${progress * 100}%` }]} />
         </View>
-        <Text style={s.progressText}>
-          {knownCount} / {totalCards}
-        </Text>
+        <Text style={s.progressText}>{knownCount} / {sessionTotal}</Text>
       </View>
 
       <View style={s.cardArea}>
         <GestureDetector gesture={gesture}>
           <Animated.View style={[s.cardWrapper, cardAnimatedStyle]}>
-            {/* Front face */}
             <Animated.View style={[s.card, frontStyle]}>
               <View style={s.cardTouchArea}>
                 <Text style={s.cardText}>{current.front}</Text>
               </View>
             </Animated.View>
 
-            {/* Back face */}
             <Animated.View style={[s.card, s.cardBack, backStyle]}>
               <View style={s.cardTouchArea}>
                 <Text style={s.cardText}>{current.back}</Text>
               </View>
             </Animated.View>
 
-            {/* Color overlay */}
             <Animated.View
               style={[
-                {
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
-                  borderRadius: 20,
-                  zIndex: 10,
-                },
+                { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, borderRadius: 20, zIndex: 10 },
                 colorOverlayStyle,
               ]}
               pointerEvents="none"
@@ -324,6 +434,20 @@ export default function StudyScreen() {
           </Animated.View>
         </GestureDetector>
       </View>
+
+      {/* Hard button area — always present in smart mode so the card never shifts up.
+          Invisible until card has been flipped at least once. */}
+      {isSmartMode && (
+        <View style={s.hardBtnArea}>
+          <Pressable
+            onPress={handleHard}
+            disabled={!hasBeenFlipped}
+            style={[s.hardBtn, { opacity: hasBeenFlipped ? 1 : 0 }]}
+          >
+            <Text style={s.hardBtnText}>Hard</Text>
+          </Pressable>
+        </View>
+      )}
 
       <Text style={s.remaining}>{pile.length} remaining</Text>
     </View>
@@ -373,7 +497,7 @@ function makeStyles(c: Colors) {
     },
     cardWrapper: {
       width: "100%" as unknown as number,
-      height: 320,
+      height: 360,
     },
     card: {
       backgroundColor: c.CARD,
@@ -402,6 +526,25 @@ function makeStyles(c: Colors) {
       textAlign: "center" as const,
       color: c.TEXT,
       lineHeight: 40,
+    },
+    hardBtnArea: {
+      height: 76,
+      alignItems: "center" as const,
+      justifyContent: "center" as const,
+    },
+    hardBtn: {
+      width: "75%" as unknown as number,
+      paddingVertical: 16,
+      alignItems: "center" as const,
+      borderRadius: 16,
+      backgroundColor: c.PRIMARY_LIGHT,
+      borderWidth: 1.5,
+      borderColor: c.PRIMARY,
+    },
+    hardBtnText: {
+      fontSize: 18,
+      fontWeight: "600" as const,
+      color: c.PRIMARY,
     },
     remaining: {
       textAlign: "center" as const,
